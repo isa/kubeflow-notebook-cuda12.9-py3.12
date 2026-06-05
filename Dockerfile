@@ -1,9 +1,7 @@
 # =============================================================================
 # Kubeflow Notebook Server
 # Base:     nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
-# Python:   3.12 (default), 3.13, 3.14  (via mise)
-# Node.js:  26 (default), 25, 24         (via mise)
-# uv:       latest                        (via mise)
+# Tools:    mise (users install python/node/uv via mise at runtime)
 # =============================================================================
 
 FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
@@ -14,7 +12,7 @@ FROM nvidia/cuda:12.9.1-cudnn-devel-ubuntu24.04
 LABEL maintainer="your-team@example.com" \
       cuda="12.9.1" \
       cudnn="9" \
-      description="Kubeflow Notebook Server — CUDA 12.9 · Python 3.12/3.13/3.14 · Node 24/25/26 · uv"
+      description="Kubeflow Notebook Server — CUDA 12.9 · mise · zsh · docker"
 
 # -----------------------------------------------------------------------------
 # Build arguments
@@ -28,16 +26,11 @@ ARG NB_PREFIX="/"
 # -----------------------------------------------------------------------------
 ENV DEBIAN_FRONTEND=noninteractive \
     TZ=UTC \
-    PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    # mise global tool dir — world-readable so all users get the tools
     MISE_DATA_DIR="/usr/local/mise" \
     MISE_CONFIG_DIR="/usr/local/mise" \
     MISE_CACHE_DIR="/usr/local/mise/cache" \
     MISE_INSTALL_PATH="/usr/local/bin/mise" \
-    # Shims path baked into the image ENV so it survives into runtime shells
     PATH="/usr/local/mise/shims:/usr/local/bin:${PATH}" \
-    # Kubeflow
     NB_PREFIX=${NB_PREFIX} \
     NB_USER=${NB_USER} \
     NB_UID=${NB_UID} \
@@ -52,7 +45,7 @@ RUN rm -f /etc/apt/sources.list.d/cuda*.list \
  && apt-get clean
 
 # -----------------------------------------------------------------------------
-# System packages — build deps for mise-compiled Python
+# System packages
 # -----------------------------------------------------------------------------
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -62,6 +55,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gnupg \
     unzip \
     zip \
+    # Build tools (needed by mise when compiling Python/Node from source)
     build-essential \
     pkg-config \
     libssl-dev \
@@ -74,6 +68,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libncurses5-dev \
     libgdbm-dev \
     libnss3-dev \
+    # Runtime
     tini \
     sudo \
     openssh-client \
@@ -83,67 +78,79 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     vim \
     htop \
     tmux \
+    zsh \
+    docker.io \
+    btop \
  && rm -rf /var/lib/apt/lists/*
 
 # -----------------------------------------------------------------------------
-# mise — install all Python + Node versions, set 3.12 / Node 26 as defaults
+# mise — installed globally, ready to use. No tools pre-installed.
+# Users run: mise install python@3.12 node@26 uv@latest
 # -----------------------------------------------------------------------------
-RUN curl https://mise.run | sh \
- && mise install python@3.12 python@3.13 python@3.14 \
-                 node@24 node@25 node@26 \
-                 uv@latest \
- && mise use --global python@3.12 node@26 uv@latest \
- && mise reshim
+RUN curl https://mise.run | sh
 
 # -----------------------------------------------------------------------------
-# Symlink all tools into /usr/local/bin — survives for all users at runtime
-# regardless of whether mise shims are on PATH
+# Rust + Cargo + CLI tools (eza, dust, dysk, xt)
+# Install rustup non-interactively, then use cargo to build tools
 # -----------------------------------------------------------------------------
-RUN ln -sf /usr/local/mise/shims/python     /usr/local/bin/python     \
- && ln -sf /usr/local/mise/shims/python     /usr/local/bin/python3    \
- && ln -sf /usr/local/mise/shims/python3.12 /usr/local/bin/python3.12 \
- && ln -sf /usr/local/mise/shims/python3.13 /usr/local/bin/python3.13 \
- && ln -sf /usr/local/mise/shims/python3.14 /usr/local/bin/python3.14 \
- && ln -sf /usr/local/mise/shims/node       /usr/local/bin/node       \
- && ln -sf /usr/local/mise/shims/npm        /usr/local/bin/npm        \
- && ln -sf /usr/local/mise/shims/npx        /usr/local/bin/npx        \
- && ln -sf /usr/local/mise/shims/uv         /usr/local/bin/uv         \
- && ln -sf /usr/local/mise/shims/uvx        /usr/local/bin/uvx
+ENV RUSTUP_HOME="/usr/local/rustup" \
+    CARGO_HOME="/usr/local/cargo" \
+    PATH="/usr/local/cargo/bin:${PATH}"
+
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path \
+ && cargo install eza \
+ && cargo install du-dust \
+ && cargo install dysk \
+ && cargo install xh \
+ && cargo install ripgrep \
+ && cargo install lesser \
+ && cargo install bat \
+ && rm -rf /usr/local/cargo/registry /usr/local/cargo/git
 
 # -----------------------------------------------------------------------------
 # Non-root user (Kubeflow convention: jovyan / UID 1000)
 # -----------------------------------------------------------------------------
 RUN existing=$(getent passwd ${NB_UID} | cut -d: -f1) \
  && if [ -n "$existing" ] && [ "$existing" != "${NB_USER}" ]; then userdel -r "$existing" 2>/dev/null || true; fi \
- && if ! id -u ${NB_USER} >/dev/null 2>&1; then useradd -m -s /bin/bash -u ${NB_UID} ${NB_USER}; fi \
+ && if ! id -u ${NB_USER} >/dev/null 2>&1; then useradd -m -s /bin/zsh -u ${NB_UID} ${NB_USER}; fi \
  && mkdir -p /home/${NB_USER}/.local/bin \
  && echo "${NB_USER} ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers \
+ && groupadd -f docker \
+ && usermod -aG docker ${NB_USER} \
  && chown -R ${NB_USER}:${NB_USER} /home/${NB_USER}
 
 # -----------------------------------------------------------------------------
-# Python packages via uv — targets mise's Python 3.12, no PEP 668 issues
-# Then symlink jupyter into /usr/local/bin so it's found at runtime
+# oh-my-zsh for jovyan + mise hook in .zshrc
 # -----------------------------------------------------------------------------
-RUN uv pip install --system \
+RUN su - ${NB_USER} -c \
+    'sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended' \
+ && echo 'export PATH=/usr/local/cargo/bin:/usr/local/mise/shims:/usr/local/bin:$PATH' >> /home/${NB_USER}/.zshrc \
+ && echo 'eval "$(mise activate zsh)"' >> /home/${NB_USER}/.zshrc \
+ && echo 'export SHELL=/bin/zsh' >> /home/${NB_USER}/.zshrc \
+ && sed -i 's/ZSH_THEME="robbyrussell"/ZSH_THEME="minimal"/' /home/${NB_USER}/.zshrc \
+ && echo 'alias ls="eza --icons"' >> /home/${NB_USER}/.zshrc \
+ && echo 'alias l="eza -xa --icons --group-directories-first"' >> /home/${NB_USER}/.zshrc \
+ && echo 'alias ll="eza -lTa --icons --group-directories-first --level=1"' >> /home/${NB_USER}/.zshrc \
+ && echo 'alias lll="eza -lTa --icons --group-directories-first --level=2"' >> /home/${NB_USER}/.zshrc \
+ && echo 'alias top="btop"' >> /home/${NB_USER}/.zshrc \
+ && echo 'alias less="bat"' >> /home/${NB_USER}/.zshrc
+
+# Tell JupyterLab terminals to use zsh
+RUN mkdir -p /etc/jupyter \
+ && echo 'c.ServerApp.terminado_settings = {"shell_command": ["/bin/zsh"]}' >> /etc/jupyter/jupyter_server_config.py
+
+# -----------------------------------------------------------------------------
+# Install JupyterLab via pip (system Python from base image) so the notebook
+# server can start. Users manage their own Pythons via mise.
+# -----------------------------------------------------------------------------
+RUN pip install --break-system-packages --no-cache-dir \
     jupyterlab \
     notebook \
     ipywidgets \
-    numpy \
-    pandas \
-    matplotlib \
-    scikit-learn \
-    torch \
-    tqdm \
-    requests \
-    httpx \
- && SCRIPTS=$(python -c "import sysconfig; print(sysconfig.get_path('scripts'))") \
- && ln -sf "${SCRIPTS}/jupyter"         /usr/local/bin/jupyter     \
- && ln -sf "${SCRIPTS}/jupyter-lab"     /usr/local/bin/jupyter-lab \
- && ln -sf "${SCRIPTS}/jupyter-server"  /usr/local/bin/jupyter-server
+ && ln -sf $(python3 -c "import sysconfig; print(sysconfig.get_path('scripts'))")/jupyter /usr/local/bin/jupyter
 
 # -----------------------------------------------------------------------------
 # Kubeflow: expose port and set entrypoint
-# Use absolute path for jupyter — bulletproof regardless of PATH at runtime
 # -----------------------------------------------------------------------------
 USER ${NB_USER}
 WORKDIR ${HOME}
